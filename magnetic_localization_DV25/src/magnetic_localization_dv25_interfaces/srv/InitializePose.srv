@@ -1,0 +1,10 @@
+geometry_msgs/PoseStamped initial_guess
+float64 rpy_search_deg
+float64 position_search_m
+uint32 max_iterations
+float64 position_converge_m
+float64 angle_converge_deg
+---
+bool success
+geometry_msgs/PoseStamped estimated_pose
+string message

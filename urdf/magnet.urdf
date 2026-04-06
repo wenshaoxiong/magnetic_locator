@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<robot name="magnet">
+  <link name="magnet_link">
+    <visual>
+      <origin xyz="0 0 0.01" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.005" length="0.02"/>
+      </geometry>
+      <material name="red">
+        <color rgba="1 0 0 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.01" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.005" length="0.02"/>
+      </geometry>
+    </collision>
+    
+    <inertial>
+      <mass value="0.05"/>
+      <inertia ixx="0.00001" ixy="0" ixz="0" iyy="0.00001" iyz="0" izz="0.00001"/>
+    </inertial>
+  </link>
+
+  <gazebo reference="magnet_link">
+    <material>Gazebo/Red</material>
+    <turnGravityOff>true</turnGravityOff> 
+  </gazebo>
+</robot>

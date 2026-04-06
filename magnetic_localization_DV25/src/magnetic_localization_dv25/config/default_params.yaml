@@ -1,0 +1,28 @@
+magnetic_localization_node:
+  ros__parameters:
+    map_frame: map
+    base_frame: base_link
+    sensor_measurements_topic: /sensor_measurements
+    sensor_measurements_in_uT: false
+    hall_topic: /hall_effect_array
+    mag_sensor_topic: /mag_sensor
+    imu_topic: /imu/data
+    robot_pose_topic: /robot_pose
+    magnetic_map_yaml: ""
+    use_lut: false
+    lut_path: ""
+    sync_slop_s: 0.03
+    field_jump_threshold_uT: 15.0
+    gradient_threshold_uT_per_m: 500.0
+    relocalize_max_gap_s: 0.5
+    relocalize_timeout_s: 5.0
+    markov_tau_s: 60.0
+    adaptive_noise_threshold_m: 0.1
+    adaptive_noise_min_dist_m: 0.01
+    meas_noise_uT: 2.0
+    process_noise_pos_3x3: [1.0e-6, 0.0, 0.0, 0.0, 1.0e-6, 0.0, 0.0, 0.0, 1.0e-6]
+    process_noise_quat_4x4: [1.0e-6, 0.0, 0.0, 0.0, 0.0, 1.0e-6, 0.0, 0.0, 0.0, 0.0, 1.0e-6, 0.0, 0.0, 0.0, 0.0, 1.0e-6]
+    sensor_positions_base_m:
+      [-0.04, -0.04, 0.0045, -0.04, 0.0, 0.0045, -0.04, 0.04, 0.0045,
+       0.0, -0.04, 0.0045, 0.0, 0.0, 0.0045, 0.0, 0.04, 0.0045,
+       0.04, -0.04, 0.0045, 0.04, 0.0, 0.0045, 0.04, 0.04, 0.0045]

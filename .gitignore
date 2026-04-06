@@ -1,0 +1,18 @@
+# 1. ROS2 工作空间编译生成的目录 (绝对不能上传)
+build/
+install/
+log/
+
+# 2. Python 缓存文件 (截图里看到了 __pycache__，必须忽略)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 3. 仿真跑出来的实验数据和日志 (比如截图底部的 final_log.csv)
+final_log.csv
+*.csv
+*.log
+
+# 4. 操作系统及编辑器生成的隐藏文件
+.vscode/
+.DS_Store

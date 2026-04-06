@@ -1,0 +1,17 @@
+sources:
+  - id: magnet_1
+    frame_id: "magnet_1_link"
+    position_m: [0.0, 0.0, 0.0]
+    moment: [0.0, 0.0, 1.0]
+    radius_m: 0.01
+    length_m: 0.02
+    type: "cylinder"
+    spherical_harmonics_path: ""
+  - id: magnet_2
+    frame_id: "magnet_2_link"
+    position_m: [0.1, 0.0, 0.0]
+    moment: [0.0, 0.0, -1.0]
+    radius_m: 0.01
+    length_m: 0.02
+    type: "cylinder"
+    spherical_harmonics_path: ""

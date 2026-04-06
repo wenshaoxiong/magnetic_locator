@@ -1,0 +1,60 @@
+<?xml version="1.0"?>
+<robot name="sensor_array">
+  <link name="world"/>
+  
+  <joint name="fixed_to_world" type="fixed">
+    <parent link="world"/>
+    <child link="sensor_array_base"/>
+    <origin xyz="0 0 0.001" rpy="0 0 0"/>
+  </joint>
+
+  <link name="sensor_array_base">
+    <visual>
+      <geometry><box size="0.12 0.12 0.002"/></geometry>
+      <material name="white"><color rgba="1 1 1 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="0.12 0.12 0.002"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.0"/><inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <gazebo reference="sensor_array_base"><material>Gazebo/White</material></gazebo>
+
+  <link name="sensor_1"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j1" type="fixed"><parent link="sensor_array_base"/><child link="sensor_1"/><origin xyz="-0.04 -0.04 0.0035"/></joint>
+  <gazebo reference="sensor_1"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_2"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j2" type="fixed"><parent link="sensor_array_base"/><child link="sensor_2"/><origin xyz="0 -0.04 0.0035"/></joint>
+  <gazebo reference="sensor_2"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_3"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j3" type="fixed"><parent link="sensor_array_base"/><child link="sensor_3"/><origin xyz="0.04 -0.04 0.0035"/></joint>
+  <gazebo reference="sensor_3"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_4"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j4" type="fixed"><parent link="sensor_array_base"/><child link="sensor_4"/><origin xyz="-0.04 0 0.0035"/></joint>
+  <gazebo reference="sensor_4"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_5"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j5" type="fixed"><parent link="sensor_array_base"/><child link="sensor_5"/><origin xyz="0 0 0.0035"/></joint>
+  <gazebo reference="sensor_5"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_6"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j6" type="fixed"><parent link="sensor_array_base"/><child link="sensor_6"/><origin xyz="0.04 0 0.0035"/></joint>
+  <gazebo reference="sensor_6"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_7"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j7" type="fixed"><parent link="sensor_array_base"/><child link="sensor_7"/><origin xyz="-0.04 0.04 0.0035"/></joint>
+  <gazebo reference="sensor_7"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_8"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j8" type="fixed"><parent link="sensor_array_base"/><child link="sensor_8"/><origin xyz="0 0.04 0.0035"/></joint>
+  <gazebo reference="sensor_8"><material>Gazebo/Green</material></gazebo>
+
+  <link name="sensor_9"><visual><geometry><box size="0.005 0.005 0.005"/></geometry><material name="green"><color rgba="0 1 0 1"/></material></visual></link>
+  <joint name="j9" type="fixed"><parent link="sensor_array_base"/><child link="sensor_9"/><origin xyz="0.04 0.04 0.0035"/></joint>
+  <gazebo reference="sensor_9"><material>Gazebo/Green</material></gazebo>
+</robot>
