@@ -99,3 +99,18 @@ python3 plot_trajectory.py
 消息：包含 header、true\_pose、imu\_rpy、magnetic\_fields 四个字段。
 集成：sensor\_simulator.py 改用自定义消息发布，替代原有的 Float64MultiArray。
 文档：更新 README.md，新增自定义消息接口说明。
+
+更新日志 (2026-03-29)
+集成：将 magnetic_localization_DV25 代入 magnetic_locator-main/magnetic_localization_DV25，作为总仓论文复现算法模块。
+接口：DV25 新增订阅 /sensor_measurements（magnetic_interfaces/SensorArrayData），对齐 2026-03-25 上游统一接口，算法端可直接接收传感器输出。
+参数：新增 sensor_measurements_topic 与 sensor_measurements_in_uT，支持话题名与磁场单位差异的兼容切换。
+依赖：DV25 包内补齐 magnetic_interfaces 依赖声明与构建依赖，避免跨包编译缺失。
+文档：完善 DV25 readme 今日更新日志与“工作反馈”，明确上游需补齐 /imu/data 等信息维度以提升论文复现完整性（详情查看DV25中的readme）
+
+更新日志 (2026-04-06)
+模型：实现“偶极子 + 3D LUT + 高阶球谐 (SH) + 圆柱体积积分近似”混合磁场模型，支持近场/远场自动切换。
+性能：集成 OpenMP 并行计算与 $O(1)$ 均匀网格查询优化，大幅降低高频采样下的 CPU 负载。
+稳定：引入 Joseph Form 协方差更新、四元数流形归一化及自适应观测权重（Adaptive R-Matrix），解决高梯度区发散问题。
+补偿：新增基于 TF 的磁源位姿外推器与基于 IMU 方差监测的在线零速修正 (ZUPT)，抑制长时运行漂移。
+集成：更新 DV25 内部参数服务器与地图配置，支持磁体几何参数（半径、长度、类型）加载，对齐论文深层复现要求。
+文档：在 DV25 README 中详细列出当前系统集成的“并行架构冗余”与“评估工具链断层”等现有问题与改进建议。
