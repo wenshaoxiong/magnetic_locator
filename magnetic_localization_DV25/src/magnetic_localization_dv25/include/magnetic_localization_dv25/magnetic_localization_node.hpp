@@ -66,6 +66,10 @@ private:
     const InitializePose::Request::SharedPtr request,
     InitializePose::Response::SharedPtr response);
 
+  void updateEKF(const rclcpp::Time & stamp, const Eigen::VectorXd & z_T, const Eigen::Vector3d & acc, bool use_acc);
+  bool relocalize(const rclcpp::Time & stamp, const Eigen::VectorXd & z_T);
+  void updateMagneticSources(const rclcpp::Time & stamp);
+
   rclcpp::Subscription<SensorArrayData>::SharedPtr sensor_array_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr hall_sub_;
   rclcpp::Subscription<MagSensorMsg>::SharedPtr mag_sub_unfiltered_;
@@ -136,6 +140,8 @@ private:
   rclcpp::Time last_meas_stamp_{0, 0, RCL_ROS_TIME};
   Eigen::VectorXd last_z_T_;
   double last_field_mean_norm_T_{0.0};
+  double last_condition_number_{1e10};
+  double last_min_dist_{0.0};
   nav_msgs::msg::Path path_msg_;
 
   uint8_t status_{MagneticPoseMsg::RELOCALIZING};

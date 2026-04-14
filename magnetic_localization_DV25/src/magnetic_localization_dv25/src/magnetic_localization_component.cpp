@@ -281,62 +281,16 @@ void MagneticLocalizationNode::sensorArrayCallback(const SensorArrayData::Shared
     }
   }
 
-  // 磁源位姿外推逻辑：根据 TF 历史计算瞬时速度并补偿时间差
-  for (const auto & src : magnetic_map_.sources()) {
-    if (src.frame_id.empty()) continue;
+  // 磁源位姿外推逻辑 (对齐论文 2025 双磁体动态场景)
+  updateMagneticSources(stamp);
 
-    try {
-      // 获取当前最新的 TF 变换 (map -> source_frame)
-      geometry_msgs::msg::TransformStamped tf = tf_buffer_->lookupTransform(
-        map_frame_, src.frame_id, tf2::TimePointZero);
-      
-      SourcePoseRecord record;
-      record.stamp = tf.header.stamp;
-      record.pos = Eigen::Vector3d(tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z);
-      record.quat = Eigen::Quaterniond(tf.transform.rotation.w, tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z);
-
-      auto & history = source_history_[src.id];
-      if (history.empty() || (rclcpp::Time(record.stamp) - rclcpp::Time(history.back().stamp)).seconds() > 1e-4) {
-        history.push_back(record);
-        if (history.size() > 2) history.pop_front();
-      }
-
-      Eigen::Vector3d extrapolated_pos = record.pos;
-      Eigen::Quaterniond extrapolated_quat = record.quat;
-
-      if (history.size() >= 2) {
-        const auto & p1 = history[0];
-        const auto & p2 = history[1];
-        double dt_tf = (rclcpp::Time(p2.stamp) - rclcpp::Time(p1.stamp)).seconds();
-        if (dt_tf > 1e-4) {
-          // 计算线速度
-          Eigen::Vector3d vel = (p2.pos - p1.pos) / dt_tf;
-          // 计算角速度 (使用四元数差分)
-          Eigen::Quaterniond dq = p2.quat * p1.quat.inverse();
-          Eigen::AngleAxisd aa(dq);
-          Eigen::Vector3d omega = (aa.axis() * aa.angle()) / dt_tf;
-
-          // 外推到传感器时间戳
-          double time_offset = (stamp - rclcpp::Time(p2.stamp)).seconds();
-          extrapolated_pos = p2.pos + vel * time_offset;
-          extrapolated_quat = p2.quat * deltaQuatFromOmega(omega, time_offset);
-        }
-      }
-
-      // 更新磁场模型中的磁源位姿
-      // 假设原始 moment 是在 source_frame 下定义的 (通常为 [0,0,m])
-      // 这里需要将其变换到 map 帧
-      Eigen::Vector3d moment_map = extrapolated_quat * Eigen::Vector3d(0, 0, src.moment.norm()); 
-      magnetic_map_.updateSourcePose(src.id, extrapolated_pos, moment_map);
-
-    } catch (const tf2::TransformException & ex) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF lookup failed for %s: %s", src.id.c_str(), ex.what());
-    }
+  // 如果有加速度计缓存，尝试进行姿态约束更新
+  Eigen::Vector3d latest_acc = Eigen::Vector3d::Zero();
+  bool use_acc = !acc_buffer_.empty();
+  if (use_acc) {
+    for (const auto & a : acc_buffer_) latest_acc += a;
+    latest_acc /= static_cast<double>(acc_buffer_.size());
   }
-
-  tf2::Quaternion q_tf;
-  q_tf.setRPY(msg->imu_rpy.x, msg->imu_rpy.y, msg->imu_rpy.z);
-  q_ = Eigen::Quaterniond(q_tf.w(), q_tf.x(), q_tf.y(), q_tf.z()).normalized();
 
   const double scale = sensor_measurements_in_uT_ ? 1e-6 : 1.0;
   Eigen::VectorXd z_T(3 * static_cast<int>(n_sensors));
@@ -385,6 +339,11 @@ void MagneticLocalizationNode::sensorArrayCallback(const SensorArrayData::Shared
     publishStatus(stamp, "GRADIENT_ANOMALY_RELOCALIZATION");
   }
 
+  // 姿态预测：利用 SensorArrayData 中的 RPY 更新四元数 (如果可用)
+  tf2::Quaternion q_tf;
+  q_tf.setRPY(msg->imu_rpy.x, msg->imu_rpy.y, msg->imu_rpy.z);
+  q_ = Eigen::Quaterniond(q_tf.w(), q_tf.x(), q_tf.y(), q_tf.z()).normalized();
+
   p_ += v_ * dt;
 
   const double phi = std::exp(-dt / std::max(1e-3, markov_tau_s_));
@@ -395,183 +354,12 @@ void MagneticLocalizationNode::sensorArrayCallback(const SensorArrayData::Shared
   P_ = 0.5 * (P_ + P_.transpose()).eval(); // 强制对称性，防止数值截断误差累计
   q_.normalize(); // 预测步后确保四元数在流形上
 
-  if (!tracking_enabled_ && status_ == MagneticPoseMsg::RELOCALIZING && !magnetic_map_.sources().empty()) {
-    if (relocalize_start_stamp_.nanoseconds() == 0) {
-      relocalize_start_stamp_ = stamp;
-    }
-    if ((stamp - relocalize_start_stamp_).seconds() > relocalize_timeout_s_) {
-      status_ = MagneticPoseMsg::LOST;
-      publishStatus(stamp, "RELOCALIZATION_TIMEOUT_LOST");
-    } else {
-      Eigen::Vector3d p_est = p_;
-      Eigen::Quaterniond q_est = q_;
-      bool converged = false;
-      const int n = static_cast<int>(n_sensors);
-      const double converge_m = 0.02;
-      const double converge_rad = 2.0 * M_PI / 180.0;
-      for (int iter = 0; iter < 30; ++iter) {
-        Eigen::VectorXd z_hat = field_model_.predictStackedFieldT(p_est, q_est);
-        for (int s = 0; s < n; ++s) {
-          z_hat.segment<3>(3 * s) += bm_;
-        }
-        const Eigen::VectorXd r = z_T - z_hat;
-
-        Eigen::MatrixXd J = Eigen::MatrixXd::Zero(3 * n, 6);
-        const double eps_p = 1e-4;
-        const double eps_a = 1e-4;
-        for (int k = 0; k < 3; ++k) {
-          Eigen::Vector3d p_pert = p_est;
-          p_pert[k] += eps_p;
-          Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_pert, q_est);
-          for (int s = 0; s < n; ++s) {
-            zh.segment<3>(3 * s) += bm_;
-          }
-          J.col(k) = (zh - z_hat) / eps_p;
-        }
-        for (int k = 0; k < 3; ++k) {
-          Eigen::Vector3d axis = Eigen::Vector3d::Zero();
-          axis[k] = 1.0;
-          const Eigen::Quaterniond dq = deltaQuatFromOmega(axis, eps_a);
-          Eigen::Quaterniond q_pert = (q_est * dq).normalized();
-          Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_est, q_pert);
-          for (int s = 0; s < n; ++s) {
-            zh.segment<3>(3 * s) += bm_;
-          }
-          J.col(3 + k) = (zh - z_hat) / eps_a;
-        }
-
-        Eigen::Matrix<double, 6, 6> H = J.transpose() * J + Eigen::Matrix<double, 6, 6>::Identity() * 1e-8;
-        Eigen::Matrix<double, 6, 1> b = J.transpose() * r;
-        Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(b);
-
-        p_est += dx.segment<3>(0);
-        const Eigen::Quaterniond dq = deltaQuatFromOmega(dx.segment<3>(3), 1.0);
-        q_est = (q_est * dq).normalized();
-
-        if (dx.segment<3>(0).norm() <= converge_m && dx.segment<3>(3).norm() <= converge_rad) {
-          converged = true;
-          break;
-        }
-      }
-      if (converged) {
-        p_ = p_est;
-        q_ = q_est;
-        tracking_enabled_ = true;
-        status_ = MagneticPoseMsg::OK;
-        publishStatus(stamp, "RELOCALIZED_OK");
-        relocalize_start_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
-      }
-    }
+  if (!tracking_enabled_ && status_ == MagneticPoseMsg::RELOCALIZING) {
+    relocalize(stamp, z_T);
   }
 
-  if (tracking_enabled_ && !magnetic_map_.sources().empty()) {
-    Eigen::VectorXd z_hat = field_model_.predictStackedFieldT(p_, q_);
-    for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-      z_hat.segment<3>(3 * i) += bm_;
-    }
-    const Eigen::VectorXd y = z_T - z_hat;
-
-    const double eps_p = 1e-4;
-    const double eps_q = 1e-5;
-    const double eps_b = 1e-6;
-
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3 * static_cast<int>(n_sensors), 22);
-    for (int k = 0; k < 3; ++k) {
-      Eigen::Vector3d p_pert = p_;
-      p_pert[k] += eps_p;
-      Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_pert, q_);
-      for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-        zh.segment<3>(3 * i) += bm_;
-      }
-      H.col(k) = (zh - z_hat) / eps_p;
-    }
-
-    for (int k = 0; k < 4; ++k) {
-      Eigen::Quaterniond q_pert = q_;
-      Eigen::Vector4d qc(q_.x(), q_.y(), q_.z(), q_.w());
-      qc[k] += eps_q;
-      q_pert = Eigen::Quaterniond(qc[3], qc[0], qc[1], qc[2]).normalized();
-      Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_, q_pert);
-      for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-        zh.segment<3>(3 * i) += bm_;
-      }
-      H.col(3 + k) = (zh - z_hat) / eps_q;
-    }
-
-    for (int k = 0; k < 3; ++k) {
-      Eigen::Vector3d b_pert = bm_;
-      b_pert[k] += eps_b;
-      Eigen::VectorXd zh = z_hat;
-      for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-        zh.segment<3>(3 * i) += (b_pert - bm_);
-      }
-      H.col(16 + k) = (zh - z_hat) / eps_b;
-    }
-
-    Eigen::MatrixXd R = Eigen::MatrixXd::Zero(3 * static_cast<int>(n_sensors), 3 * static_cast<int>(n_sensors));
-    const Eigen::Matrix3d R_base = R_field_;
-    const Eigen::Matrix3d Rot = q_.toRotationMatrix();
-    
-    for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-      // 计算当前传感器在 map 帧下的估计位置
-      const Eigen::Vector3d p_sensor_map = p_ + Rot * sensor_positions_base_[static_cast<size_t>(i)];
-      
-      // 计算传感器到所有磁源的最小距离
-      double d_min = std::numeric_limits<double>::max();
-      for (const auto & s : magnetic_map_.sources()) {
-        d_min = std::min(d_min, (p_sensor_map - s.position_m).norm());
-      }
-      
-      // 自适应噪声模型：距离越近，梯度越大，噪声容忍度越高
-      double adaptive_scale = 1.0;
-      if (d_min < adaptive_noise_threshold_m_) {
-        // 使用反比例函数增加噪声权重
-        adaptive_scale = std::pow(adaptive_noise_threshold_m_ / std::max(adaptive_noise_min_dist_m_, d_min), 2.0);
-      }
-      
-      R.block<3, 3>(3 * i, 3 * i) = R_base * adaptive_scale;
-    }
-
-    const Eigen::MatrixXd S = H * P_ * H.transpose() + R;
-    const Eigen::MatrixXd K = P_ * H.transpose() * S.ldlt().solve(Eigen::MatrixXd::Identity(S.rows(), S.cols()));
-    const Eigen::VectorXd dx = K * y;
-
-    p_ += dx.segment<3>(0);
-    Eigen::Vector4d qc(q_.x(), q_.y(), q_.z(), q_.w());
-    qc += dx.segment<4>(3);
-    q_ = Eigen::Quaterniond(qc[3], qc[0], qc[1], qc[2]).normalized();
-    v_ += dx.segment<3>(7);
-    bg_ += dx.segment<3>(10);
-    ba_ += dx.segment<3>(13);
-    bm_ += dx.segment<3>(16);
-    g_ += dx.segment<3>(19);
-
-    const Eigen::Matrix<double, 22, 22> I = Eigen::Matrix<double, 22, 22>::Identity();
-    const Eigen::Matrix<double, 22, 22> KH = K * H;
-    // 使用 Joseph Form 更新协方差矩阵，保证数值稳定性和正定性
-    P_ = (I - KH) * P_ * (I - KH).transpose() + K * R * K.transpose();
-    P_ = 0.5 * (P_ + P_.transpose()).eval(); // 强制对称性，消除截断误差累计
-
-    // 在静止状态下执行零速修正 (ZUPT)
-    if (is_stationary_) {
-      const Eigen::Vector3d y_zupt = -v_; // 期望速度为 0
-      Eigen::Matrix<double, 3, 22> H_zupt = Eigen::Matrix<double, 3, 22>::Zero();
-      H_zupt.block<3, 3>(0, 7) = Eigen::Matrix3d::Identity(); // 速度状态在 7,8,9
-      
-      const Eigen::Matrix3d R_zupt = Eigen::Matrix3d::Identity() * 1e-6; // 零速观测噪声极小
-      const Eigen::Matrix3d S_zupt = H_zupt * P_ * H_zupt.transpose() + R_zupt;
-      const Eigen::Matrix<double, 22, 3> K_zupt = P_ * H_zupt.transpose() * S_zupt.inverse();
-      
-      const Eigen::VectorXd dx_zupt = K_zupt * y_zupt;
-      p_ += dx_zupt.segment<3>(0);
-      v_ += dx_zupt.segment<3>(7);
-      
-      const Eigen::Matrix<double, 22, 22> I22 = Eigen::Matrix<double, 22, 22>::Identity();
-      P_ = (I22 - K_zupt * H_zupt) * P_;
-      P_ = 0.5 * (P_ + P_.transpose()).eval();
-    }
-
-    status_ = MagneticPoseMsg::OK;
+  if (tracking_enabled_) {
+    updateEKF(stamp, z_T, latest_acc, use_acc);
   }
 
   publishOutputs(stamp);
@@ -656,6 +444,9 @@ void MagneticLocalizationNode::syncedMagCallback(
     return;
   }
 
+  // 磁源位姿外推逻辑 (对齐论文 2025 双磁体动态场景)
+  updateMagneticSources(stamp);
+
   // 异步观测处理：Cache 回溯
   auto closest_pose_msg = robot_pose_cache_->getElemBeforeTime(stamp);
   if (closest_pose_msg) {
@@ -733,191 +524,20 @@ void MagneticLocalizationNode::syncedMagCallback(
   bm_ *= phi;
   g_ *= phi;
 
-  P_ = P_ = P_ + makeProcessNoise(Q_pos_, Q_quat_, dt, markov_tau_s_, is_stationary_);
+  P_ = P_ + makeProcessNoise(Q_pos_, Q_quat_, dt, markov_tau_s_, is_stationary_);
   P_ = 0.5 * (P_ + P_.transpose()).eval(); // 强制对称性
   q_.normalize(); // 流形归一化
 
-  if (!tracking_enabled_ && status_ == MagneticPoseMsg::RELOCALIZING && !magnetic_map_.sources().empty()) {
-    if (relocalize_start_stamp_.nanoseconds() == 0) {
-      relocalize_start_stamp_ = stamp;
-    }
-    if ((stamp - relocalize_start_stamp_).seconds() > relocalize_timeout_s_) {
-      status_ = MagneticPoseMsg::LOST;
-      publishStatus(stamp, "RELOCALIZATION_TIMEOUT_LOST");
-    } else {
-      Eigen::Vector3d p_est = p_;
-      Eigen::Quaterniond q_est = q_;
-      bool converged = false;
-      const int n = static_cast<int>(n_sensors);
-      const double converge_m = 0.02;
-      const double converge_rad = 2.0 * M_PI / 180.0;
-      for (int iter = 0; iter < 30; ++iter) {
-        Eigen::VectorXd z_hat = field_model_.predictStackedFieldT(p_est, q_est);
-        for (int s = 0; s < n; ++s) {
-          z_hat.segment<3>(3 * s) += bm_;
-        }
-        const Eigen::VectorXd r = z_T - z_hat;
-
-        Eigen::MatrixXd J = Eigen::MatrixXd::Zero(3 * n, 6);
-        const double eps_p = 1e-4;
-        const double eps_a = 1e-4;
-        for (int k = 0; k < 3; ++k) {
-          Eigen::Vector3d p_pert = p_est;
-          p_pert[k] += eps_p;
-          Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_pert, q_est);
-          for (int s = 0; s < n; ++s) {
-            zh.segment<3>(3 * s) += bm_;
-          }
-          J.col(k) = (zh - z_hat) / eps_p;
-        }
-        for (int k = 0; k < 3; ++k) {
-          Eigen::Vector3d axis = Eigen::Vector3d::Zero();
-          axis[k] = 1.0;
-          const Eigen::Quaterniond dq = deltaQuatFromOmega(axis, eps_a);
-          Eigen::Quaterniond q_pert = (q_est * dq).normalized();
-          Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_est, q_pert);
-          for (int s = 0; s < n; ++s) {
-            zh.segment<3>(3 * s) += bm_;
-          }
-          J.col(3 + k) = (zh - z_hat) / eps_a;
-        }
-
-        Eigen::Matrix<double, 6, 6> H = J.transpose() * J + Eigen::Matrix<double, 6, 6>::Identity() * 1e-8;
-        Eigen::Matrix<double, 6, 1> b = J.transpose() * r;
-        Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(b);
-
-        p_est += dx.segment<3>(0);
-        const Eigen::Quaterniond dq = deltaQuatFromOmega(dx.segment<3>(3), 1.0);
-        q_est = (q_est * dq).normalized();
-
-        if (dx.segment<3>(0).norm() <= converge_m && dx.segment<3>(3).norm() <= converge_rad) {
-          converged = true;
-          break;
-        }
-      }
-      if (converged) {
-        p_ = p_est;
-        q_ = q_est;
-        tracking_enabled_ = true;
-        status_ = MagneticPoseMsg::OK;
-        publishStatus(stamp, "RELOCALIZED_OK");
-        relocalize_start_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
-      }
-    }
+  if (!tracking_enabled_ && status_ == MagneticPoseMsg::RELOCALIZING) {
+    relocalize(stamp, z_T);
   }
 
-  if (tracking_enabled_ && !magnetic_map_.sources().empty()) {
-    Eigen::VectorXd z_hat = field_model_.predictStackedFieldT(p_, q_);
-    for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-      z_hat.segment<3>(3 * i) += bm_;
-    }
-    const Eigen::VectorXd y = z_T - z_hat;
-
-    const double eps_p = 1e-4;
-    const double eps_q = 1e-5;
-    const double eps_b = 1e-6;
-
-    Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3 * static_cast<int>(n_sensors), 22);
-    for (int k = 0; k < 3; ++k) {
-      Eigen::Vector3d p_pert = p_;
-      p_pert[k] += eps_p;
-      Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_pert, q_);
-      for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-        zh.segment<3>(3 * i) += bm_;
-      }
-      H.col(k) = (zh - z_hat) / eps_p;
-    }
-
-    for (int k = 0; k < 4; ++k) {
-      Eigen::Quaterniond q_pert = q_;
-      Eigen::Vector4d qc(q_.x(), q_.y(), q_.z(), q_.w());
-      qc[k] += eps_q;
-      q_pert = Eigen::Quaterniond(qc[3], qc[0], qc[1], qc[2]).normalized();
-      Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_, q_pert);
-      for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-        zh.segment<3>(3 * i) += bm_;
-      }
-      H.col(3 + k) = (zh - z_hat) / eps_q;
-    }
-
-    for (int k = 0; k < 3; ++k) {
-      Eigen::Vector3d b_pert = bm_;
-      b_pert[k] += eps_b;
-      Eigen::VectorXd zh = z_hat;
-      for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-        zh.segment<3>(3 * i) += (b_pert - bm_);
-      }
-      H.col(16 + k) = (zh - z_hat) / eps_b;
-    }
-
-    Eigen::MatrixXd R = Eigen::MatrixXd::Zero(3 * static_cast<int>(n_sensors), 3 * static_cast<int>(n_sensors));
-    const Eigen::Matrix3d R_base = R_field_;
-    const Eigen::Matrix3d Rot = q_.toRotationMatrix();
-    
-    for (int i = 0; i < static_cast<int>(n_sensors); ++i) {
-      // 计算当前传感器在 map 帧下的估计位置
-      const Eigen::Vector3d p_sensor_map = p_ + Rot * sensor_positions_base_[static_cast<size_t>(i)];
-      
-      // 计算传感器到所有磁源的最小距离
-      double d_min = std::numeric_limits<double>::max();
-      for (const auto & s : magnetic_map_.sources()) {
-        d_min = std::min(d_min, (p_sensor_map - s.position_m).norm());
-      }
-      
-      // 自适应噪声模型：距离越近，梯度越大，噪声容忍度越高
-      double adaptive_scale = 1.0;
-      if (d_min < adaptive_noise_threshold_m_) {
-        // 使用反比例函数增加噪声权重
-        adaptive_scale = std::pow(adaptive_noise_threshold_m_ / std::max(adaptive_noise_min_dist_m_, d_min), 2.0);
-      }
-      
-      R.block<3, 3>(3 * i, 3 * i) = R_base * adaptive_scale;
-    }
-
-    const Eigen::MatrixXd S = H * P_ * H.transpose() + R;
-    const Eigen::MatrixXd K = P_ * H.transpose() * S.ldlt().solve(Eigen::MatrixXd::Identity(S.rows(), S.cols()));
-    const Eigen::VectorXd dx = K * y;
-
-    p_ += dx.segment<3>(0);
-    Eigen::Vector4d qc(q_.x(), q_.y(), q_.z(), q_.w());
-    qc += dx.segment<4>(3);
-    q_ = Eigen::Quaterniond(qc[3], qc[0], qc[1], qc[2]).normalized();
-    v_ += dx.segment<3>(7);
-    bg_ += dx.segment<3>(10);
-    ba_ += dx.segment<3>(13);
-    bm_ += dx.segment<3>(16);
-    g_ += dx.segment<3>(19);
-
-    const Eigen::Matrix<double, 22, 22> I = Eigen::Matrix<double, 22, 22>::Identity();
-    const Eigen::Matrix<double, 22, 22> KH = K * H;
-    // 使用 Joseph Form 更新协方差矩阵
-    P_ = (I - KH) * P_ * (I - KH).transpose() + K * R * K.transpose();
-    P_ = 0.5 * (P_ + P_.transpose()).eval(); // 强制对称性
-
-    // 在静止状态下执行零速修正 (ZUPT)
-    if (is_stationary_) {
-      const Eigen::Vector3d y_zupt = -v_; // 期望速度为 0
-      Eigen::Matrix<double, 3, 22> H_zupt = Eigen::Matrix<double, 3, 22>::Zero();
-      H_zupt.block<3, 3>(0, 7) = Eigen::Matrix3d::Identity(); // 速度状态在 7,8,9
-      
-      const Eigen::Matrix3d R_zupt = Eigen::Matrix3d::Identity() * 1e-6; // 零速观测噪声极小
-      const Eigen::Matrix3d S_zupt = H_zupt * P_ * H_zupt.transpose() + R_zupt;
-      const Eigen::Matrix<double, 22, 3> K_zupt = P_ * H_zupt.transpose() * S_zupt.inverse();
-      
-      const Eigen::VectorXd dx_zupt = K_zupt * y_zupt;
-      p_ += dx_zupt.segment<3>(0);
-      v_ += dx_zupt.segment<3>(7);
-      
-      const Eigen::Matrix<double, 22, 22> I22 = Eigen::Matrix<double, 22, 22>::Identity();
-      P_ = (I22 - K_zupt * H_zupt) * P_;
-      P_ = 0.5 * (P_ + P_.transpose()).eval();
-    }
-
-    status_ = MagneticPoseMsg::OK;
+  if (tracking_enabled_) {
+    updateEKF(stamp, z_T, acc, true);
   }
 
   publishOutputs(stamp);
-}  // namespace magnetic_localization_dv25
+}
 
 void MagneticLocalizationNode::publishOutputs(const rclcpp::Time & stamp)
 {
@@ -1021,6 +641,8 @@ void MagneticLocalizationNode::publishStatus(const rclcpp::Time & stamp, const s
     st.header.frame_id = map_frame_;
     st.status = status_;
     st.message = message;
+    st.condition_number = static_cast<float>(last_condition_number_);
+    st.min_dist_m = static_cast<float>(last_min_dist_);
     st.cpu_percent = 0.0f;
     st.memory_mb = 0.0f;
     status_pub_->publish(std::move(loaned_msg));
@@ -1030,6 +652,8 @@ void MagneticLocalizationNode::publishStatus(const rclcpp::Time & stamp, const s
     st.header.frame_id = map_frame_;
     st.status = status_;
     st.message = message;
+    st.condition_number = static_cast<float>(last_condition_number_);
+    st.min_dist_m = static_cast<float>(last_min_dist_);
     st.cpu_percent = 0.0f;
     st.memory_mb = 0.0f;
     status_pub_->publish(st);
@@ -1069,6 +693,21 @@ void MagneticLocalizationNode::handleInitializePose(
     request->initial_guess.pose.orientation.y,
     request->initial_guess.pose.orientation.z);
   q0.normalize();
+
+  // 如果有加速度计数据，执行重力对齐初始化 (对齐论文 Section 2.2)
+  if (!acc_buffer_.empty()) {
+    Eigen::Vector3d acc_sum = Eigen::Vector3d::Zero();
+    for (const auto & a : acc_buffer_) acc_sum += a;
+    const Eigen::Vector3d acc_avg = acc_sum / static_cast<double>(acc_buffer_.size());
+    
+    // 计算从传感器坐标系重力向量到 map 帧重力向量 [0,0,g] 的旋转
+    // 这将修正初始猜测中的 Roll 和 Pitch
+    const Eigen::Vector3d unit_acc = acc_avg.normalized();
+    const Eigen::Vector3d unit_g = g_.normalized(); // 默认为 [0,0,9.8]
+    const Eigen::Quaterniond q_align = Eigen::Quaterniond::FromTwoVectors(unit_acc, q0.inverse() * unit_g);
+    q0 = (q0 * q_align).normalized();
+    RCLCPP_INFO(get_logger(), "Gravity alignment performed during initialization.");
+  }
 
   const double rpy_deg = request->rpy_search_deg > 0.0 ? request->rpy_search_deg : 5.0;
   const double pos_m = request->position_search_m > 0.0 ? request->position_search_m : 0.05;
@@ -1115,14 +754,35 @@ void MagneticLocalizationNode::handleInitializePose(
   bool converged = false;
   const double converge_rad = converge_deg * M_PI / 180.0;
 
+  // 获取最新的加速度计数据用于重力约束 (Section 2.2)
+  Eigen::Vector3d latest_acc = Eigen::Vector3d::Zero();
+  bool has_acc = !acc_buffer_.empty();
+  if (has_acc) {
+    for (const auto & a : acc_buffer_) latest_acc += a;
+    latest_acc /= static_cast<double>(acc_buffer_.size());
+  }
+
   for (uint32_t iter = 0; iter < iters; ++iter) {
     Eigen::VectorXd z_hat = field_model_.predictStackedFieldT(p_est, q_est);
     for (int s = 0; s < n_sensors; ++s) {
       z_hat.segment<3>(3 * s) += bm_;
     }
-    const Eigen::VectorXd r = last_z_T_ - z_hat;
+    
+    // 构造观测向量，包含磁场矢量、模长(Section 2.2)和重力矢量
+    int obs_dim = 3 * n_sensors + n_sensors;
+    if (has_acc) obs_dim += 3;
+    
+    Eigen::VectorXd r = Eigen::VectorXd::Zero(obs_dim);
+    Eigen::MatrixXd J = Eigen::MatrixXd::Zero(obs_dim, 6);
+    
+    r.segment(0, 3 * n_sensors) = last_z_T_ - z_hat;
+    for (int s = 0; s < n_sensors; ++s) {
+      r(3 * n_sensors + s) = last_z_T_.segment<3>(3 * s).norm() - z_hat.segment<3>(3 * s).norm();
+    }
+    if (has_acc) {
+      r.segment<3>(4 * n_sensors) = latest_acc - (q_est.inverse() * g_);
+    }
 
-    Eigen::MatrixXd J = Eigen::MatrixXd::Zero(3 * n_sensors, 6);
     const double eps_p = 1e-4;
     const double eps_a = 1e-4;
 
@@ -1130,10 +790,12 @@ void MagneticLocalizationNode::handleInitializePose(
       Eigen::Vector3d p_pert = p_est;
       p_pert[k] += eps_p;
       Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_pert, q_est);
+      for (int s = 0; s < n_sensors; ++s) zh.segment<3>(3 * s) += bm_;
+      
+      J.col(k).segment(0, 3 * n_sensors) = (zh - z_hat) / eps_p;
       for (int s = 0; s < n_sensors; ++s) {
-        zh.segment<3>(3 * s) += bm_;
+        J(3 * n_sensors + s, k) = (zh.segment<3>(3 * s).norm() - z_hat.segment<3>(3 * s).norm()) / eps_p;
       }
-      J.col(k) = (zh - z_hat) / eps_p;
     }
 
     for (int k = 0; k < 3; ++k) {
@@ -1142,19 +804,24 @@ void MagneticLocalizationNode::handleInitializePose(
       const Eigen::Quaterniond dq = deltaQuatFromOmega(axis, eps_a);
       Eigen::Quaterniond q_pert = (q_est * dq).normalized();
       Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_est, q_pert);
+      for (int s = 0; s < n_sensors; ++s) zh.segment<3>(3 * s) += bm_;
+      
+      J.col(3 + k).segment(0, 3 * n_sensors) = (zh - z_hat) / eps_a;
       for (int s = 0; s < n_sensors; ++s) {
-        zh.segment<3>(3 * s) += bm_;
+        J(3 * n_sensors + s, 3 + k) = (zh.segment<3>(3 * s).norm() - z_hat.segment<3>(3 * s).norm()) / eps_a;
       }
-      J.col(3 + k) = (zh - z_hat) / eps_a;
+      if (has_acc) {
+        J.col(3 + k).segment<3>(4 * n_sensors) = (q_pert.inverse() * g_ - q_est.inverse() * g_) / eps_a;
+      }
     }
 
-    Eigen::Matrix<double, 6, 6> H = J.transpose() * J + Eigen::Matrix<double, 6, 6>::Identity() * 1e-8;
-    Eigen::Matrix<double, 6, 1> b = J.transpose() * r;
-    Eigen::Matrix<double, 6, 1> dx = H.ldlt().solve(b);
+    Eigen::Matrix<double, 6, 6> H_ls = J.transpose() * J + Eigen::Matrix<double, 6, 6>::Identity() * 1e-8;
+    Eigen::Matrix<double, 6, 1> b_ls = J.transpose() * r;
+    Eigen::Matrix<double, 6, 1> dx = H_ls.ldlt().solve(b_ls);
 
     p_est += dx.segment<3>(0);
-    const Eigen::Quaterniond dq = deltaQuatFromOmega(dx.segment<3>(3), 1.0);
-    q_est = (q_est * dq).normalized();
+    const Eigen::Quaterniond dq_gn = deltaQuatFromOmega(dx.segment<3>(3), 1.0);
+    q_est = (q_est * dq_gn).normalized();
 
     if (dx.segment<3>(0).norm() <= converge_m && dx.segment<3>(3).norm() <= converge_rad) {
       converged = true;
@@ -1184,10 +851,326 @@ void MagneticLocalizationNode::handleInitializePose(
     response->estimated_pose.pose.orientation.z = q_.z();
     response->estimated_pose.pose.orientation.w = q_.w();
     publishStatus(last_meas_stamp_, "INITIALIZED_OK");
-  } else {
-    response->success = false;
-    response->message = "INITIALIZATION_NOT_CONVERGED";
   }
 }
+
+void MagneticLocalizationNode::updateMagneticSources(const rclcpp::Time & stamp)
+{
+  for (const auto & src : magnetic_map_.sources()) {
+    if (src.frame_id.empty()) continue;
+
+    try {
+      geometry_msgs::msg::TransformStamped tf = tf_buffer_->lookupTransform(
+        map_frame_, src.frame_id, tf2::TimePointZero);
+      
+      SourcePoseRecord record;
+      record.stamp = tf.header.stamp;
+      record.pos = Eigen::Vector3d(tf.transform.translation.x, tf.transform.translation.y, tf.transform.translation.z);
+      record.quat = Eigen::Quaterniond(tf.transform.rotation.w, tf.transform.rotation.x, tf.transform.rotation.y, tf.transform.rotation.z);
+
+      auto & history = source_history_[src.id];
+      if (history.empty() || (rclcpp::Time(record.stamp) - rclcpp::Time(history.back().stamp)).seconds() > 1e-4) {
+        history.push_back(record);
+        if (history.size() > 2) history.pop_front();
+      }
+
+      Eigen::Vector3d extrapolated_pos = record.pos;
+      Eigen::Quaterniond extrapolated_quat = record.quat;
+
+      if (history.size() >= 2) {
+        const auto & p1 = history[0];
+        const auto & p2 = history[1];
+        double dt_tf = (rclcpp::Time(p2.stamp) - rclcpp::Time(p1.stamp)).seconds();
+        if (dt_tf > 1e-4) {
+          Eigen::Vector3d vel = (p2.pos - p1.pos) / dt_tf;
+          Eigen::Quaterniond dq = p2.quat * p1.quat.inverse();
+          Eigen::AngleAxisd aa(dq);
+          Eigen::Vector3d omega = (aa.axis() * aa.angle()) / dt_tf;
+
+          double time_offset = (stamp - rclcpp::Time(p2.stamp)).seconds();
+          extrapolated_pos = p2.pos + vel * time_offset;
+          extrapolated_quat = p2.quat * deltaQuatFromOmega(omega, time_offset);
+        }
+      }
+
+      Eigen::Vector3d moment_map = extrapolated_quat * Eigen::Vector3d(0, 0, src.moment.norm()); 
+      magnetic_map_.updateSourcePose(src.id, extrapolated_pos, moment_map);
+
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "TF lookup failed for %s: %s", src.id.c_str(), ex.what());
+    }
+  }
+}
+
+void MagneticLocalizationNode::updateEKF(const rclcpp::Time & stamp, const Eigen::VectorXd & z_T, const Eigen::Vector3d & acc, bool use_acc)
+{
+  if (!tracking_enabled_ || magnetic_map_.sources().empty()) return;
+
+  const int n = static_cast<int>(sensor_positions_base_.size());
+  Eigen::VectorXd z_hat = field_model_.predictStackedFieldT(p_, q_);
+  for (int i = 0; i < n; ++i) {
+    z_hat.segment<3>(3 * i) += bm_;
+  }
+  
+  // 增加磁场模长观测项 (Section 2.2)，提高收敛速度
+  int rows = 3 * n + n; 
+  if (use_acc) rows += 3;
+
+  Eigen::MatrixXd H = Eigen::MatrixXd::Zero(rows, 22);
+  Eigen::VectorXd y_full = Eigen::VectorXd::Zero(rows);
+  
+  // 1. 磁场矢量残差
+  y_full.segment(0, 3 * n) = z_T - z_hat;
+  
+  // 2. 磁场模长残差
+  for (int i = 0; i < n; ++i) {
+    y_full(3 * n + i) = z_T.segment<3>(3 * i).norm() - z_hat.segment<3>(3 * i).norm();
+  }
+
+  Eigen::Vector3d g_pred = q_.inverse() * g_;
+  if (use_acc) {
+    y_full.segment<3>(4 * n) = acc - g_pred;
+  }
+
+  const double eps_p = 1e-4;
+  const double eps_q = 1e-5;
+  const double eps_b = 1e-6;
+
+  // Position Jacobian
+  for (int k = 0; k < 3; ++k) {
+    Eigen::Vector3d p_pert = p_;
+    p_pert[k] += eps_p;
+    Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_pert, q_);
+    for (int i = 0; i < n; ++i) zh.segment<3>(3 * i) += bm_;
+    
+    H.col(k).segment(0, 3 * n) = (zh - z_hat) / eps_p;
+    for (int i = 0; i < n; ++i) {
+      H(3 * n + i, k) = (zh.segment<3>(3 * i).norm() - z_hat.segment<3>(3 * i).norm()) / eps_p;
+    }
+  }
+
+  // Orientation Jacobian
+  for (int k = 0; k < 4; ++k) {
+    Eigen::Quaterniond q_pert = q_;
+    Eigen::Vector4d qc(q_.x(), q_.y(), q_.z(), q_.w());
+    qc[k] += eps_q;
+    q_pert = Eigen::Quaterniond(qc[3], qc[0], qc[1], qc[2]).normalized();
+    
+    Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_, q_pert);
+    for (int i = 0; i < n; ++i) zh.segment<3>(3 * i) += bm_;
+    
+    H.col(3 + k).segment(0, 3 * n) = (zh - z_hat) / eps_q;
+    for (int i = 0; i < n; ++i) {
+      H(3 * n + i, 3 + k) = (zh.segment<3>(3 * i).norm() - z_hat.segment<3>(3 * i).norm()) / eps_q;
+    }
+
+    if (use_acc) {
+      const Eigen::Vector3d gp = q_pert.inverse() * g_;
+      H.col(3 + k).segment<3>(4 * n) = (gp - g_pred) / eps_q;
+    }
+  }
+
+  // Bias Jacobian
+  for (int k = 0; k < 3; ++k) {
+    Eigen::Vector3d b_pert = bm_;
+    b_pert[k] += eps_b;
+    Eigen::VectorXd zh = z_hat;
+    for (int i = 0; i < n; ++i) zh.segment<3>(3 * i) += (b_pert - bm_);
+    H.col(16 + k).segment(0, 3 * n) = (zh - z_hat) / eps_b;
+    for (int i = 0; i < n; ++i) {
+      H(3 * n + i, 16 + k) = (zh.segment<3>(3 * i).norm() - z_hat.segment<3>(3 * i).norm()) / eps_b;
+    }
+  }
+
+  // Gravity Jacobian (in map frame)
+  if (use_acc) {
+    for (int k = 0; k < 3; ++k) {
+      Eigen::Vector3d g_map_pert = g_;
+      g_map_pert[k] += 1e-6;
+      const Eigen::Vector3d gp = q_.inverse() * g_map_pert;
+      H.col(19 + k).segment<3>(4 * n) = (gp - g_pred) / 1e-6;
+      // 重力在 map 帧的变化不直接影响磁场观测，所以 H(0:4n, 19+k) 保持为 0
+    }
+  }
+
+  // Measurement Noise
+  Eigen::MatrixXd R = Eigen::MatrixXd::Zero(rows, rows);
+  const Eigen::Matrix3d Rot = q_.toRotationMatrix();
+  double global_min_dist = std::numeric_limits<double>::max();
+  for (int i = 0; i < n; ++i) {
+    const Eigen::Vector3d p_sensor_map = p_ + Rot * sensor_positions_base_[static_cast<size_t>(i)];
+    double d_min = std::numeric_limits<double>::max();
+    for (const auto & s : magnetic_map_.sources()) {
+      d_min = std::min(d_min, (p_sensor_map - s.position_m).norm());
+    }
+    global_min_dist = std::min(global_min_dist, d_min);
+    
+    double adaptive_scale = 1.0;
+    if (d_min < adaptive_noise_threshold_m_) {
+      adaptive_scale = std::pow(adaptive_noise_threshold_m_ / std::max(adaptive_noise_min_dist_m_, d_min), 2.0);
+    }
+    R.block<3, 3>(3 * i, 3 * i) = R_field_ * adaptive_scale;
+    // 模长观测噪声设为矢量观测的 1/3 (启发式)
+    R(3 * n + i, 3 * n + i) = R_field_(0, 0) * adaptive_scale * 0.33;
+  }
+  last_min_dist_ = global_min_dist;
+  if (use_acc) {
+    R.block<3, 3>(4 * n, 4 * n) = Eigen::Matrix3d::Identity() * 1e-2;
+  }
+
+  // Kalman Gain
+  const Eigen::MatrixXd S = H * P_ * H.transpose() + R;
+  const Eigen::MatrixXd K = P_ * H.transpose() * S.ldlt().solve(Eigen::MatrixXd::Identity(S.rows(), S.cols()));
+  const Eigen::VectorXd dx = K * y_full;
+
+  // Update State
+  p_ += dx.segment<3>(0);
+  Eigen::Vector4d qc(q_.x(), q_.y(), q_.z(), q_.w());
+  qc += dx.segment<4>(3);
+  q_ = Eigen::Quaterniond(qc[3], qc[0], qc[1], qc[2]).normalized();
+  v_ += dx.segment<3>(7);
+  bg_ += dx.segment<3>(10);
+  ba_ += dx.segment<3>(13);
+  bm_ += dx.segment<3>(16);
+  g_ += dx.segment<3>(19);
+
+  // Covariance Update (Joseph Form)
+  const Eigen::Matrix<double, 22, 22> I22 = Eigen::Matrix<double, 22, 22>::Identity();
+  const Eigen::Matrix<double, 22, 22> KH = K * H;
+  P_ = (I22 - KH) * P_ * (I22 - KH).transpose() + K * R * K.transpose();
+  P_ = 0.5 * (P_ + P_.transpose()).eval();
+
+  // Condition Number for observability check
+  Eigen::JacobiSVD<Eigen::MatrixXd> svd(H.leftCols<6>(), Eigen::ComputeThinU | Eigen::ComputeThinV);
+  const auto & singular_values = svd.singularValues();
+  if (singular_values.size() > 0 && singular_values(singular_values.size() - 1) > 1e-12) {
+    last_condition_number_ = singular_values(0) / singular_values(singular_values.size() - 1);
+  }
+
+  // ZUPT
+  if (is_stationary_) {
+    const Eigen::Vector3d y_zupt = -v_;
+    Eigen::Matrix<double, 3, 22> H_zupt = Eigen::Matrix<double, 3, 22>::Zero();
+    H_zupt.block<3, 3>(0, 7) = Eigen::Matrix3d::Identity();
+    const Eigen::Matrix3d R_zupt = Eigen::Matrix3d::Identity() * 1e-6;
+    
+    const Eigen::MatrixXd S_z = H_zupt * P_ * H_zupt.transpose() + R_zupt;
+    const Eigen::Matrix<double, 22, 3> K_z = P_ * H_zupt.transpose() * S_z.inverse();
+    
+    v_ += K_z * y_zupt;
+    const Eigen::Matrix<double, 22, 22> KH_z = K_z * H_zupt;
+    P_ = (I22 - KH_z) * P_ * (I22 - KH_z).transpose() + K_z * R_zupt * K_z.transpose();
+    P_ = 0.5 * (P_ + P_.transpose()).eval();
+  }
+}
+
+bool MagneticLocalizationNode::relocalize(const rclcpp::Time & stamp, const Eigen::VectorXd & z_T)
+{
+  if (magnetic_map_.sources().empty()) return false;
+
+  if (relocalize_start_stamp_.nanoseconds() == 0) {
+    relocalize_start_stamp_ = stamp;
+  }
+
+  if ((stamp - relocalize_start_stamp_).seconds() > relocalize_timeout_s_) {
+    status_ = MagneticPoseMsg::LOST;
+    publishStatus(stamp, "RELOCALIZATION_TIMEOUT_LOST");
+    return false;
+  }
+
+  Eigen::Vector3d p_est = p_;
+  Eigen::Quaterniond q_est = q_;
+  bool converged = false;
+  const int n = static_cast<int>(sensor_positions_base_.size());
+  const double converge_m = 0.02;
+  const double converge_rad = 2.0 * M_PI / 180.0;
+
+  // 获取最新的加速度计数据用于重力约束 (Section 2.2)
+  Eigen::Vector3d latest_acc = Eigen::Vector3d::Zero();
+  bool has_acc = !acc_buffer_.empty();
+  if (has_acc) {
+    for (const auto & a : acc_buffer_) latest_acc += a;
+    latest_acc /= static_cast<double>(acc_buffer_.size());
+  }
+
+  for (int iter = 0; iter < 30; ++iter) {
+    Eigen::VectorXd z_hat = field_model_.predictStackedFieldT(p_est, q_est);
+    for (int s = 0; s < n; ++s) z_hat.segment<3>(3 * s) += bm_;
+    
+    // 构造观测向量，包含磁场矢量、模长(Section 2.2)和重力矢量
+    int obs_dim = 3 * n + n;
+    if (has_acc) obs_dim += 3;
+    
+    Eigen::VectorXd r = Eigen::VectorXd::Zero(obs_dim);
+    Eigen::MatrixXd J = Eigen::MatrixXd::Zero(obs_dim, 6);
+    
+    r.segment(0, 3 * n) = z_T - z_hat;
+    for (int s = 0; s < n; ++s) {
+      r(3 * n + s) = z_T.segment<3>(3 * s).norm() - z_hat.segment<3>(3 * s).norm();
+    }
+    if (has_acc) {
+      r.segment<3>(4 * n) = latest_acc - (q_est.inverse() * g_);
+    }
+
+    const double eps_p = 1e-4;
+    const double eps_a = 1e-4;
+
+    for (int k = 0; k < 3; ++k) {
+      Eigen::Vector3d p_pert = p_est;
+      p_pert[k] += eps_p;
+      Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_pert, q_est);
+      for (int s = 0; s < n; ++s) zh.segment<3>(3 * s) += bm_;
+      
+      J.col(k).segment(0, 3 * n) = (zh - z_hat) / eps_p;
+      for (int s = 0; s < n; ++s) {
+        J(3 * n + s, k) = (zh.segment<3>(3 * s).norm() - z_hat.segment<3>(3 * s).norm()) / eps_p;
+      }
+    }
+
+    for (int k = 0; k < 3; ++k) {
+      Eigen::Vector3d axis = Eigen::Vector3d::Zero();
+      axis[k] = 1.0;
+      const Eigen::Quaterniond dq = deltaQuatFromOmega(axis, eps_a);
+      Eigen::Quaterniond q_pert = (q_est * dq).normalized();
+      Eigen::VectorXd zh = field_model_.predictStackedFieldT(p_est, q_pert);
+      for (int s = 0; s < n; ++s) zh.segment<3>(3 * s) += bm_;
+      
+      J.col(3 + k).segment(0, 3 * n) = (zh - z_hat) / eps_a;
+      for (int s = 0; s < n; ++s) {
+        J(3 * n + s, 3 + k) = (zh.segment<3>(3 * s).norm() - z_hat.segment<3>(3 * s).norm()) / eps_a;
+      }
+      if (has_acc) {
+        J.col(3 + k).segment<3>(4 * n) = (q_pert.inverse() * g_ - q_est.inverse() * g_) / eps_a;
+      }
+    }
+
+    Eigen::Matrix<double, 6, 6> H_ls = J.transpose() * J + Eigen::Matrix<double, 6, 6>::Identity() * 1e-8;
+    Eigen::Matrix<double, 6, 1> b_ls = J.transpose() * r;
+    Eigen::Matrix<double, 6, 1> dx = H_ls.ldlt().solve(b_ls);
+
+    p_est += dx.segment<3>(0);
+    const Eigen::Quaterniond dq_gn = deltaQuatFromOmega(dx.segment<3>(3), 1.0);
+    q_est = (q_est * dq_gn).normalized();
+
+    if (dx.segment<3>(0).norm() <= converge_m && dx.segment<3>(3).norm() <= converge_rad) {
+      converged = true;
+      break;
+    }
+  }
+
+  if (converged) {
+    p_ = p_est;
+    q_ = q_est;
+    tracking_enabled_ = true;
+    status_ = MagneticPoseMsg::OK;
+    publishStatus(stamp, "RELOCALIZED_OK");
+    relocalize_start_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+    return true;
+  }
+
+  return false;
+}
+
+}  // namespace magnetic_localization_dv25
 
 RCLCPP_COMPONENTS_REGISTER_NODE(magnetic_localization_dv25::MagneticLocalizationNode)

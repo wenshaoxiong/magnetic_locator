@@ -94,55 +94,52 @@ python3 scripts/evaluate_bag.py --bag /path/to/bag --out_dir /path/to/out
 - 动态调参使用 ROS2 参数回调方式；若团队统一要求 `rqt_reconfigure` 插件，需要补齐对应工具链说明
 - 需在真实 Gazebo/rosbag 数据上做参数标定与性能基准（100 Hz、CPU<20%、内存<300 MB）
 
+## 更新日志 (2026-04-14)
+
+### 日期
+2026-04-14
+
+### 更新概况
+根据论文 **Da Veiga et al. - 2025 - Magnetic localization during manipulation by two robotized permanent magnets** 进行算法深度复现与改进。重点解决了动态磁源补偿、初始化鲁棒性、以及 EKF 观测模型的数学完整性。
+
+### 更新具体情况
+1.  **重力辅助初始化 (Gravity-Aligned Initialization)：** 改进了 `InitializePose` 服务逻辑。在搜索初始位姿前，利用加速度计自动对齐 Roll 和 Pitch，将搜索空间从 6-DOF 降至 4-DOF（位置 + 绕重力轴偏航），显著提升了初始收敛速度和成功率。
+2.  **增强型重定位 (Robust Relocalization)：** 在 Gauss-Newton 重定位循环中引入了重力矢量约束和磁场模长（Norm）观测。相比单纯依赖磁场矢量，该改进极大增强了算法在磁场奇异区域（Singularity Regions）的鲁棒性。
+3.  **磁场模长观测项 (Magnetic Norm Observation)：** 遵循论文 Section 2.2，在 EKF 更新步中加入了磁场强度模长 $\|\mathbf{B}\|$。该项对位置高度敏感且不依赖传感器姿态，有效缓解了姿态估计偏差对位置收敛的影响。
+4.  **动态磁源 TF 外推 (TF Extrapolation)：** 统一了所有输入路径的磁源位姿处理逻辑。通过提取 `updateMagneticSources` 助手函数，确保在任何时间戳下都能根据 TF 历史记录精确外推双磁体的瞬时位置与姿态，适配论文所述的动态操作场景。
+5.  **诊断接口升级 (Diagnostic Upgrades)：** 更新了 `AlgorithmStatus` 消息定义，新增 `condition_number`（可观性条件数）和 `min_dist_m`（最小磁源距离）字段，为下游分析提供更丰富的算法健康度数据。
+
+### 工作反馈（针对上游 Category 1）
+1.  **IMU 数据维度：** 再次强调，算法目前虽然能处理 RPY，但为实现论文原汁原味的 EKF 动力学预测，**强烈建议上游提供原始加速度和角速度数据**。
+2.  **TF 广播：** 确认磁体 TF 广播的频率应不低于 50Hz，以减少外推误差。
+
 ## 更新日志 (2026-04-06)
 
 ### 日期
-
 2026-04-06
 
 ### 更新概况
-
-- **模型精细化与混合建模**：实现了“偶极子 + 3D LUT + 高阶球谐 (SH) + 圆柱体积积分近似”的四位一体混合磁场模型。
-- **高性能计算优化**：引入 OpenMP 并行加速计算与 $O(1)$ 均匀网格 LUT 查询引擎，显著降低高频采样下的 CPU 开销。
-- **EKF 稳定性与鲁棒性增强**：集成 Joseph Form 协方差更新、四元数流形归一化及自适应观测权重（Adaptive R-Matrix）。
-- **运动补偿与在线校准**：新增基于 TF 的磁源位姿外推器与基于 IMU 方差监测的零速修正（ZUPT）逻辑。
-- **配置与接口扩展**：更新参数服务器与地图配置，支持磁体几何参数（半径、长度、类型）及球谐系数路径加载。
+模型精细化与 EKF 稳定性增强。引入了混合磁场观测模型（LUT + 偶极子 + 高阶修正），并针对长距离运行优化了数值稳定性。
 
 ### 更新具体情况
-
-- **磁场模型深度复现**
-  - **距离触发切换**：当传感器与磁源距离 $R < 3D$（直径）时，自动从点偶极子切换至 5 点多偶极子积分近似模型，补偿近场非线性失真。
-  - **高阶球谐集成**：支持从外部 YAML 加载球谐系数，在远场提供比单纯偶极子更精确的场值修正。
-  - **混合查询逻辑**：优先使用核心操作区（Workspace）的 1mm LUT，超出范围自动回退至解析模型，兼顾全局覆盖与局部精度。
-- **数值计算优化**
-  - **并行预测**：利用 `#pragma omp parallel for` 对传感器阵列的理论场值计算进行并行化处理。
-  - **缓存友好型 LUT**：优化 LUT 内存布局（[ix][iy][iz][c]），确保三线性插值时的内存访问局部性。
-- **EKF 核心改进**
-  - **Joseph Form**：采用 $P = (I-KH)P(I-KH)^T + KRK^T$ 更新公式，强制保证协方差矩阵的正定性。
-  - **自适应权重**：根据传感器到磁源的距离动态缩放观测噪声 $R$，在高梯度区自动调大噪声容忍度，防止滤波器发散。
-  - **流形约束**：在预测与更新步后显式执行四元数归一化与协方差对称化（$P = 0.5(P+P^T)$）。
-- **同步与补偿**
-  - **位姿外推器**：通过监听 TF 历史计算磁源瞬时线速度与角速度，外推至传感器时间戳，解决 100Hz/250Hz 频率不匹配带来的时间滞后。
-  - **零速修正 (ZUPT)**：实时监测加速度计与陀螺仪方差，在静止状态下触发伪观测更新，抑制 IMU 长时间运行产生的漂移。
+1.  **混合观测模型：** 实现“偶极子 + 3D LUT + 高阶球谐 (SH) + 圆柱体积积分近似”混合磁场模型。在 R < 3D 区域自动切换至高精度模型，并在工作空间核心区优先调用 LUT。
+2.  **数值稳定性增强：** 将协方差更新逻辑替换为 Joseph Form，并引入四元数流形归一化，防止数值截断误差导致协方差矩阵失去正定性。
+3.  **磁源位姿外推：** 基于 TF 历史实现了磁源运动补偿，确保观测矩阵 H 中的源坐标与传感器时间戳严格对齐。
+4.  **中间件优化：** 引入 LoanedMessage 零拷贝发布机制，并配套 FastDDS 共享内存配置文件。
 
 ### 工作反馈（现有问题与改进建议）
-
-针对目前仓库整体集成情况，仍存在以下待解决问题：
-
-- **并行架构冗余**：原有的 `localization_node.py` 与新的 `DV25` 节点存在逻辑重复且数据链路不互通（Python 节点绕过了统一接口）。
-- **评估工具链断层**：`plot_trajectory.py` 依赖离线 CSV 格式，而 `DV25` 输出为 ROS2 话题，亟需增加“实时话题记录至 CSV”的转换节点。
-- **上游数据维度不足**：`/sensor_measurements` 统一接口目前缺失关键的 IMU 角速度与线加速度，导致 `DV25` 的 9-DOF 预测模型无法全功能运行。
-- **模型实现简化**：当前球谐函数 (SH) 评估为基础累加逻辑，需进一步引入严格的 Legendre 递归公式以完全复现论文毫米级精度。
-- **系统时间同步**：需确保所有 Python 仿真脚本严格遵循 `/clock` 仿真时钟，避免 C++ 节点因时间跳变触发 `DT_INVALID`。
+1.  **架构冗余：** 现有 Python 版本的定位节点与当前 C++ 版本功能重叠，建议后期统一。
+2.  **评估链条断裂：** 现有 `plot_trajectory.py` 仍依赖离线 CSV，无法实时可视化 C++ 节点的定位轨迹。
+3.  **上游 IMU 数据：** 上游传感器模拟器目前只提供姿态 RPY，建议补齐角速度和线加速度，以支持更完整的 9 轴预测模型。
+4.  **球谐模型参数：** 现有 SH 实现为简化占位符，需进一步获取论文中的具体 Legendre 递归系数。
+5.  **系统时间同步：** 需确保所有 Python 仿真脚本严格遵循 `/clock` 仿真时钟，避免 C++ 节点因时间跳变触发 `DT_INVALID`。
 
 ## 更新日志 (2026-03-29)
 
 ### 日期
-
 2026-03-29
 
 ### 更新概况
-
 - 将 `magnetic_localization_DV25` 代入 `magnetic_locator-main`，用于 DV25 论文磁定位算法端实现与验证
 - 新增接口包（msg/srv）与核心定位节点（组件 + 可执行），对齐算法侧统一输入输出
 - 新增对 `magnetic_locator-main` 2026-03-25 统一接口 `/sensor_measurements(SensorArrayData)` 的输入适配，保证算法可直接接收上游输出
@@ -151,56 +148,17 @@ python3 scripts/evaluate_bag.py --bag /path/to/bag --out_dir /path/to/out
 - 新增文件日志（INFO+）与 ROS2 参数动态更新回调
 
 ### 更新具体情况
-
 - 隔离与结构
   - 新增目录 `magnetic_localization_DV25/`，包含 `src/`、`config/`、`launch/`、`test/`、`scripts/` 与文档资源
-  - `.gitignore` 仅约束工作区构建产物（build/install/log 等），保留架构图与脚本可版本化
 - 接口与话题
-  - 新增 `magnetic_localization_dv25_interfaces`：
-    - `msg/MagSensorMsg`：传感器位姿 + 磁场观测（算法侧统一输入）
-    - `msg/MagneticPose`：`header + pose + covariance[36] + status(OK/RELOCALIZING/LOST)`
-    - `msg/AlgorithmStatus`：算法状态与诊断摘要
-    - `srv/InitializePose`：初始化搜索与收敛判定
-  - 核心节点订阅：
-    - `/sensor_measurements`（SensorArrayData；与 magnetic_locator-main 2026-03-25 文档一致）
-    - `/hall_effect_array`（Float64MultiArray，按传感器顺序扁平化 3N；默认按 µT 输入并在节点侧转为 T）
-    - `/mag_sensor`（MagSensorMsg，可绕过 raw 扁平化输入）
-    - `/imu/data`（sensor_msgs/Imu）
-  - 核心节点发布：
-    - `/magnetic_pose`、`/magnetic_path`、`/algorithm_status`
-    - TF：`map -> base_link`，时间戳严格使用输入 `header.stamp`
-  - 兼容性参数：
-    - `sensor_measurements_topic`：默认 `/sensor_measurements`
-    - `sensor_measurements_in_uT`：控制 SensorArrayData 的 `magnetic_fields` 是否按 µT 输入（默认 false）
+  - 新增 `magnetic_localization_dv25_interfaces`（msg/srv/status）
+  - 核心节点订阅：`/sensor_measurements`、`/hall_effect_array`、`/mag_sensor`、`/imu/data`
+  - 核心节点发布：`/magnetic_pose`、`/magnetic_path`、`/algorithm_status`、TF
 - 同步与滤波
-  - 采用 `message_filters::sync_policies::ApproximateTime` 对（霍尔/IMU）与（MagSensor/IMU）分别软同步，默认窗口 `sync_slop_s=0.03`
-  - IMU 预测（仅在使用 `/imu/data` 输入路径时）：使用角速度积分更新四元数，线加速度经姿态旋转并加重力项更新速度/位置
-  - RPY 姿态注入（使用 `/sensor_measurements` 输入路径时）：使用 `SensorArrayData.imu_rpy` 直接构造姿态四元数并做简化时间推进
-  - 观测更新：磁场观测残差 `z - h(x)`，数值差分构造 Jacobian，执行 EKF 更新（Joseph 形式协方差更新）
-  - 过程噪声：位置 `process_noise_pos_3x3` 与四元数 `process_noise_quat_4x4` 支持独立参数化
+  - 采用 `message_filters::sync_policies::ApproximateTime`
+  - IMU 预测与 RPY 姿态注入路径适配
+  - 观测更新与 Joseph 形式协方差更新
 - 观测模型与 LUT
-  - 静态磁源配置：读取 `config/magnetic_map.yaml`（磁源 id、位置、磁矩；球谐路径字段预留）
-  - 磁场模型：默认使用偶极子解析模型；可选加载 `magnetic_field_lut.npz` 并进行三线性插值查询
-  - LUT 生成：`scripts/generate_lut.py`（使用 `np.savez` 生成 ZIP_STORED，匹配节点端 NPZ 解析器）
+  - 静态磁源配置与偶极子/LUT 切换
 - 初始化与失效恢复
-  - 提供 `/initialize_pose`：在初值附近进行 RPY ± 搜索并迭代收敛后进入跟踪（默认阈值 2 cm / 2°）
-  - 失效检测：磁场强度突变 `field_jump_threshold_uT` 或梯度异常 `gradient_threshold_uT_per_m` 触发 `RELOCALIZING`
-  - 自动恢复：`RELOCALIZING` 状态下周期尝试局部重定位；超过 `relocalize_timeout_s` 进入 `LOST`
-- 启动与参数
-  - 新增 `launch/magnetic_localization.launch.py`：默认加载 `config/default_params.yaml`，支持 `sim:=true` 切换 `use_sim_time`
-  - 参数支持运行时动态更新（ROS2 参数回调）：同步窗口、失效阈值、Markov 常数、测量噪声与过程噪声矩阵
-- 测试与评估
-  - gtest 覆盖：磁图加载、磁场预测、EKF 更新、失效检测、TF 发布、输出消息发布、初始化路径
-  - 离线评估：`scripts/evaluate_bag.py` 生成 `error_stats.yaml` 与 `trajectory_plot.pdf`
-- 日志
-  - INFO+ 日志写入 `~/.ros/log/magnetic_localization/<date>.log`（与 `/algorithm_status` 发布同步写入）
-
-### 工作反馈
-
-为提升 DV25 论文复现的模型完整性与指标可复现性，上游建议补齐以下输出与约定：
-
-- 发布标准 IMU 话题 `/imu/data`（`sensor_msgs/Imu`），至少包含 `angular_velocity`（rad/s）与 `linear_acceleration`（m/s²），并与 `/sensor_measurements.header.stamp` 同时间戳体系
-- 明确并统一 `SensorArrayData.magnetic_fields` 的单位（Tesla 或 µT）与三分量坐标系（与 `header.frame_id` 保持一致）
-- 提供传感器阵列几何与展平顺序的可追溯描述（顺序/安装位姿/坐标系），避免上下游对齐误差
-- 做时间同步与延迟评估，确保 `/sensor_measurements` 与 `/imu/data` 可在 ≤30 ms 内软同步
-- 保持或提供真值/标定辅助输出（如 `/groundtruth_pose` 或 `true_pose`）以支撑误差评估与参数标定
+  - 提供 `/initialize_pose` 服务与局部重定位逻辑
