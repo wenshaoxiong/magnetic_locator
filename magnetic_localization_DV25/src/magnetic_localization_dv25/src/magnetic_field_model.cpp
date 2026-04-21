@@ -1,6 +1,7 @@
 #include "magnetic_localization_dv25/magnetic_field_model.hpp"
 
 #include <cmath>
+#include <algorithm>
 
 namespace magnetic_localization_dv25
 {

@@ -28,6 +28,10 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <Eigen/Dense>
+#include <Eigen/Cholesky>
+#include <Eigen/LU>
+#include <Eigen/SVD>
 
 #include "magnetic_localization_dv25/magnetic_field_model.hpp"
 #include "magnetic_localization_dv25/magnetic_map.hpp"

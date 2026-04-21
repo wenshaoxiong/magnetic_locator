@@ -1,4 +1,8 @@
 #include "magnetic_localization_dv25/magnetic_localization_node.hpp"
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+#include <cmath>
 
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -7,7 +11,6 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 
 #include <chrono>
-#include <cmath>
 #include <limits>
 #include <filesystem>
 #include <iomanip>
@@ -348,7 +351,7 @@ void MagneticLocalizationNode::sensorArrayCallback(const SensorArrayData::Shared
 
   const double phi = std::exp(-dt / std::max(1e-3, markov_tau_s_));
   bm_ *= phi;
-  g_ *= phi;
+  // Gravity g_ should not decay as it is a physical constant in map frame
 
   P_ = P_ + makeProcessNoise(Q_pos_, Q_quat_, dt, markov_tau_s_, is_stationary_);
   P_ = 0.5 * (P_ + P_.transpose()).eval(); // 强制对称性，防止数值截断误差累计
@@ -522,7 +525,7 @@ void MagneticLocalizationNode::syncedMagCallback(
 
   const double phi = std::exp(-dt / std::max(1e-3, markov_tau_s_));
   bm_ *= phi;
-  g_ *= phi;
+  // Gravity g_ should not decay
 
   P_ = P_ + makeProcessNoise(Q_pos_, Q_quat_, dt, markov_tau_s_, is_stationary_);
   P_ = 0.5 * (P_ + P_.transpose()).eval(); // 强制对称性
@@ -1057,7 +1060,19 @@ void MagneticLocalizationNode::updateEKF(const rclcpp::Time & stamp, const Eigen
     const Eigen::MatrixXd S_z = H_zupt * P_ * H_zupt.transpose() + R_zupt;
     const Eigen::Matrix<double, 22, 3> K_z = P_ * H_zupt.transpose() * S_z.inverse();
     
-    v_ += K_z * y_zupt;
+    const Eigen::VectorXd dx_z = K_z * y_zupt;
+    
+    // Apply full state update from ZUPT
+    p_ += dx_z.segment<3>(0);
+    Eigen::Vector4d qc_z(q_.x(), q_.y(), q_.z(), q_.w());
+    qc_z += dx_z.segment<4>(3);
+    q_ = Eigen::Quaterniond(qc_z[3], qc_z[0], qc_z[1], qc_z[2]).normalized();
+    v_ += dx_z.segment<3>(7);
+    bg_ += dx_z.segment<3>(10);
+    ba_ += dx_z.segment<3>(13);
+    bm_ += dx_z.segment<3>(16);
+    g_ += dx_z.segment<3>(19);
+
     const Eigen::Matrix<double, 22, 22> KH_z = K_z * H_zupt;
     P_ = (I22 - KH_z) * P_ * (I22 - KH_z).transpose() + K_z * R_zupt * K_z.transpose();
     P_ = 0.5 * (P_ + P_.transpose()).eval();

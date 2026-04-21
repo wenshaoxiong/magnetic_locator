@@ -1,6 +1,7 @@
 #include "magnetic_localization_dv25/magnetic_field_lut.hpp"
 
 #include <fstream>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
